@@ -4,9 +4,9 @@
 set -e
 
 # Configuration
-DATASET="/data/group_data/dei-group/archaia/archaia_hf_final"
-IMAGES_ROOT="/data/group_data/dei-group/archaia"
-PORT=7861
+DATASET="/home/mohithr/pw/storage/archaia_dataset_hf_v3"
+IMAGES_ROOT="/home/urmid/archaia/"
+PORT=7881
 SHARE="--share"
 
 cd "$(dirname "$0")/.."
@@ -22,7 +22,5 @@ mkdir -p "$HF_HOME"
 echo "--- ArchAIaGPT: Launch Mode ---"
 
 python app.py \
-    --dataset "${DATASET}" \
-    --images_root "${IMAGES_ROOT}" \
     --port ${PORT} \
     ${SHARE}

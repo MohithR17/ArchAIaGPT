@@ -4,10 +4,23 @@
 set -e
 
 # Configuration
-DATASET="/data/group_data/dei-group/archaia/archaia_hf_final"
-IMAGES_ROOT="/data/group_data/dei-group/archaia"
+DATASET="/home/mohithr/pw/storage/archaia_dataset_hf_v3"
+IMAGES_ROOT="/home/urmid/archaia/"
 INDEX_DIR="indexes"
-MODELS=("clip" "bm25" "gemma" "vlm2vec" "e5-omni") # qwen3-vl requires pooling runner (vLLM)
+## Which models to build. Edit this list or override by exporting MODELS (space-separated)
+## Example: export MODELS=("clip" "gemma") && ./scripts/build_all_indexes.sh
+MODELS=("clip" "gemma" "qwen3-vl")
+
+declare -A MODEL_IDS=(
+    [clip]="openai/clip-vit-base-patch32"
+    [gemma]="google/embeddinggemma-300m"
+    [qwen3-vl]="Qwen/Qwen3-VL-Embedding-2B"
+)
+declare -A BATCH_SIZES=(
+    [clip]=32
+    [gemma]=32
+    [qwen3-vl]=4
+)
 DEVICE="cuda"
 
 cd "$(dirname "$0")/.."
@@ -25,6 +38,8 @@ for MODEL in "${MODELS[@]}"; do
         --out_dir     "${INDEX_DIR}" \
         --images_root "${IMAGES_ROOT}" \
         --model_type  "${MODEL}" \
+        --model_id    "${MODEL_IDS[$MODEL]}" \
+        --batch_size  "${BATCH_SIZES[$MODEL]}" \
         --device      "${DEVICE}"
 done
 
