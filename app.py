@@ -11,6 +11,10 @@ import sys
 import torch
 import numpy as np
 from pathlib import Path
+import uuid
+from io import BytesIO
+import base64
+from typing import List, Optional
 
 # Local imports for retrieval and pipeline logic
 from retrieval.retriever import Retriever
@@ -26,6 +30,125 @@ pipe: ArchAIaGPT = None
 dataset = None                  
 project_choices: list = []      
 feedback_mgr = FeedbackManager()
+
+
+def _normalize_image_path_list(raw_paths) -> List[str]:
+    if raw_paths is None:
+        return []
+    if isinstance(raw_paths, list):
+        return [str(p) for p in raw_paths if p]
+    if isinstance(raw_paths, str):
+        try:
+            parsed = json.loads(raw_paths)
+        except json.JSONDecodeError:
+            return [raw_paths] if raw_paths.strip() else []
+        if isinstance(parsed, list):
+            return [str(p) for p in parsed if p]
+        if isinstance(parsed, str) and parsed.strip():
+            return [parsed]
+    return []
+
+
+def _safe_json_load(raw_value):
+    if not raw_value:
+        return {}
+    if isinstance(raw_value, dict):
+        return raw_value
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _to_base64(img):
+    buf = BytesIO()
+    img.save(buf, format="JPEG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _opencontext_url(row):
+    raw_uuid = str(row.get("uuid_hex", "") or "").strip()
+    if not raw_uuid:
+        return ""
+    try:
+        return f"https://opencontext.org/subjects/{uuid.UUID(raw_uuid)}"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_range(start, stop):
+    if start and stop:
+        return f"{start} to {stop}"
+    return str(start or stop or "-")
+
+
+def _format_coords(row):
+    lon = row.get("longitude", "-")
+    lat = row.get("latitude", "-")
+    if lon == "-" and lat == "-":
+        return "-"
+    return f"[{lon}, {lat}]"
+
+
+def _condition_notes(row):
+    cond = str(row.get("recovered_condition", "-") or "-")
+    rec_text = _safe_json_load(row.get("recovered_text_fields_json"))
+    notes = rec_text.get("Condition Notes")
+    if isinstance(notes, list) and notes:
+        return ", ".join(str(n) for n in notes if n)
+    return cond
+
+
+def _artifact_html(idx: int, result) -> str:
+    row = dataset[idx]
+    title = result.label or row.get("label") or result.artifact_id or f"Artifact {idx}"
+    oc_url = _opencontext_url(row)
+    project_val = row.get("project_label") or row.get("project") or "-"
+    class_val = row.get("item_class_label") or row.get("recovered_object_type") or "-"
+    material_val = row.get("recovered_material") or "-"
+    date_val = _format_range(row.get("earliest"), row.get("latest"))
+    loc_val = _format_coords(row)
+    cond_notes = _condition_notes(row)
+    desc = result.description or row.get("description") or "No technical description available."
+
+    images = load_artifact_images(idx)
+    if images:
+        image_html = "".join(
+            f"<img class='artifact-img' src='data:image/jpeg;base64,{_to_base64(img)}' />"
+            for img in images[:4]
+        )
+    else:
+        image_html = "<div class='artifact-noimg'>No image available</div>"
+
+    link_html = f"<a href='{oc_url}' target='_blank' rel='noopener noreferrer'>OpenContext</a>" if oc_url else "No OpenContext link"
+
+    return f"""
+    <div class="artifact-card">
+      <div class="artifact-images">{image_html}</div>
+      <div class="artifact-body">
+        <div class="artifact-header">
+          <div>
+            <div class="artifact-title">{title}</div>
+            <div class="artifact-subtitle">Score: {result.fused_score:.3f} | Artifact {result.idx}</div>
+          </div>
+          <div class="artifact-link">{link_html}</div>
+        </div>
+        <div class="artifact-meta">
+          <div><b>Project:</b> {project_val}</div>
+          <div><b>Class/Type:</b> {class_val}</div>
+          <div><b>Material:</b> {material_val}</div>
+          <div><b>Dates:</b> {date_val}</div>
+          <div><b>Location:</b> {loc_val}</div>
+          <div><b>Condition:</b> {cond_notes}</div>
+        </div>
+        <div class="artifact-desc">{desc}</div>
+      </div>
+    </div>
+    """
+
 
 def load_artifact_images(idx: int):
     """
@@ -54,28 +177,24 @@ def load_artifact_images(idx: int):
                 break
     
     # Fallback: Load from local filesystem using image_paths metadata
-    elif "image_paths" in dataset.column_names and IMAGES_ROOT:
+    elif "image_paths" in dataset.column_names:
         from PIL import Image as PILImage
         raw_paths = row.get("image_paths", "[]")
         
         try:
-            rel_paths = json.loads(raw_paths) if isinstance(raw_paths, str) else []
-            if isinstance(rel_paths, str): 
-                rel_paths = [rel_paths]
+            rel_paths = _normalize_image_path_list(raw_paths)
             
             for rp in rel_paths:
-                # Normalise path separators and handle absolute/relative lookups
                 clean_path = rp.lstrip("/")
                 abs_path = Path(IMAGES_ROOT) / clean_path
-                
+
                 if abs_path.exists():
                     images.append(PILImage.open(abs_path).convert("RGB"))
                 else:
-                    # Secondary lookkup relative to the dataset directory
                     alt_path = Path(DATASET_PATH).parent / clean_path
                     if alt_path.exists():
                         images.append(PILImage.open(alt_path).convert("RGB"))
-                        
+
                 # Limit to 4 images to prevent UI clutter
                 if len(images) >= 4: 
                     break
@@ -95,13 +214,14 @@ def search_fn(query, image_query, top_k, text_weight, project_filter, do_generat
 
     # Map model names from UI to internal identifiers
     emb_name = embedding_model.split(" (")[0]
+
     emb_map = {
-        "BM25": "bm25",
+        # "BM25": "bm25",
         "EmbeddingGemma-300m": "gemma",
         "CLIP": "clip",
         "Qwen3-VL-Embedding-2B": "qwen3-vl",
-        "e5-omni-3B": "e5-omni",
-        "VLM2Vec-Qwen2VL-2B": "vlm2vec"
+        # "e5-omni-3B": "e5-omni",
+        # "VLM2Vec-Qwen2VL-2B": "vlm2vec"
     }
     emb_type = emb_map.get(emb_name, "clip")
     
@@ -113,9 +233,9 @@ def search_fn(query, image_query, top_k, text_weight, project_filter, do_generat
     # Generation model configuration
     gen_model_map = {
         "gpt-5-nano": "gpt-5-nano",
-        "Qwen3-VL-2B-Instruct": "qwen3-vl",
-        "InternVL3-1B": "internvl3",
-        "Ovis2-1B": "ovis2",
+        "Qwen3-VL-2B-Instruct": "Qwen/Qwen3-VL-2B-Instruct",
+        "InternVL3-1B": "OpenGVLab/InternVL3-1B",
+        "Ovis2-1B": "AIDC-AI/Ovis2-1B",
         "gemini-3-flash-preview": "gemini"
     }
     gen_key = gen_model_map.get(generation_model, generation_model)
@@ -124,10 +244,14 @@ def search_fn(query, image_query, top_k, text_weight, project_filter, do_generat
     if gen_key:
         # Determine the backend provider based on the model name
         backend_provider = "openai" if "gpt" in gen_key.lower() else "gemini" if "gemini" in gen_key.lower() else "vllm"
-        if gen_key in ["qwen3-vl", "internvl3", "ovis2"]:
-             backend_provider = gen_key
-        
-        gen_override = get_generator(backend=backend_provider, model_name=generation_model, device=pipe.device)
+        if gen_key.startswith("Qwen/"):
+             backend_provider = "qwen3-vl"
+        elif gen_key.startswith("OpenGVLab/"):
+             backend_provider = "internvl3"
+        elif gen_key.startswith("AIDC-AI/"):
+             backend_provider = "ovis2"
+
+        gen_override = get_generator(backend=backend_provider, model_name=gen_key, device=pipe.device)
 
     # Apply site-level filtering if selected
     filters = None
@@ -147,14 +271,10 @@ def search_fn(query, image_query, top_k, text_weight, project_filter, do_generat
 
     results = outputs.results
     
-    # Process images for the gallery and format technical metadata
-    gallery_items = []
+    evidence_cards = []
     for r in results:
-        artifact_images = load_artifact_images(r.idx)
-        for img in artifact_images:
-            if img:
-                label = r.label or f"Artifact {r.idx}"
-                gallery_items.append((img, f"{label} (Score: {r.fused_score:.2f})"))
+        evidence_cards.append(_artifact_html(r.idx, r))
+    evidence_html = "\n".join(evidence_cards) if evidence_cards else "<div class='artifact-empty'>No artifact metadata found.</div>"
 
     details_list = []
     for i, r in enumerate(results, 1):
@@ -178,7 +298,7 @@ def search_fn(query, image_query, top_k, text_weight, project_filter, do_generat
         "generated_response": final_answer
     }
 
-    return final_answer, gallery_items, details_md, interaction_info
+    return final_answer, evidence_html, details_md, interaction_info
 
 def save_feedback_fn(interaction_info, rating, comment):
     """Persistence hook for saving user quality ratings."""
@@ -232,12 +352,12 @@ def save_battle_feedback_fn(battle_info, winner, comment):
 def build_app() -> gr.Blocks:
     """Configures the Gradio UI layout and event bindings."""
     embedding_models = [
-        "BM25 (Text only)",
+        # "BM25 (Text only)",
         "EmbeddingGemma-300m (Text only)",
         "CLIP (Multimodal)",
         "Qwen3-VL-Embedding-2B (Multimodal)",
-        "e5-omni-3B (Multimodal)",
-        "VLM2Vec-Qwen2VL-2B (Multimodal)"
+        # "e5-omni-3B (Multimodal)",
+        # "VLM2Vec-Qwen2VL-2B (Multimodal)"
     ]
     generation_models = [
         "gpt-5-nano", 
@@ -247,48 +367,110 @@ def build_app() -> gr.Blocks:
         "gemini-3-flash-preview"
     ]
 
-    with gr.Blocks(title="ArchAIaGPT", css=".gradio-container { max-width: 1400px !important; }") as app:
-        gr.Markdown("# ArchAIaGPT Assistant")
+    with gr.Blocks(title="ArchAIaGPT — Archaeological RAG Assistant", css="""
+        .main-title {
+            font-size: 3rem;
+            font-weight: 800;
+            letter-spacing: -0.04em;
+            margin-bottom: 0.25rem;
+        }
+        .subtitle {
+            font-size: 1.1rem;
+            opacity: 0.78;
+            margin-bottom: 1.5rem;
+        }
+        .artifact-card {
+            border: 1px solid var(--border-color-primary, #e5e7eb);
+            border-radius: 8px;
+            padding: 16px;
+            background-color: var(--background-fill-secondary, #fafafa);
+        }
+        .artifact-card + .artifact-card {
+            margin-top: 20px;
+        }
+        .artifact-title {
+            margin-top: 0;
+            margin-bottom: 12px;
+            color: var(--body-text-color, inherit);
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+        .artifact-images {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .artifact-img {
+            max-height: 200px;
+            max-width: 300px;
+            object-fit: contain;
+            border-radius: 6px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .artifact-noimg {
+            font-style: italic;
+            opacity: 0.7;
+            margin-bottom: 12px;
+        }
+        .artifact-meta {
+            margin-bottom: 16px;
+            font-size: 1em;
+            line-height: 1.6;
+            color: var(--body-text-color, inherit);
+        }
+        .artifact-meta a {
+            color: inherit;
+            text-decoration: underline;
+        }
+        .artifact-desc {
+            margin-top: 10px;
+            font-size: 0.95em;
+            line-height: 1.5;
+            color: var(--body-text-color, inherit);
+        }
+        .artifact-empty {
+            padding: 12px 0;
+            opacity: 0.8;
+        }
+    """) as app:
+        gr.HTML("""
+        <div class="main-title">ArchAIaGPT</div>
+        <div class="subtitle">Retrieval-Augmented Archaeological Assistant</div>
+        """)
         
         interaction_state = gr.State({})
         battle_state = gr.State({})
 
         with gr.Tabs():
-            # Main Exploration Tab
-            with gr.TabItem("Direct Chat"):
+            with gr.TabItem("Single Query"):
                 with gr.Row():
-                    # Configuration Sidebar
-                    with gr.Column(scale=1, min_width=300):
-                        with gr.Group():
-                            gr.Markdown("### Control Panel")
+                    with gr.Column(scale=1):
+                        query_text = gr.Textbox(
+                            label="Query",
+                            placeholder="e.g. Describe pottery fragments from the Archaic period found in Sardis...",
+                            lines=3,
+                        )
+                        query_img = gr.Image(label="Image Query (Optional)", type="pil")
+
+                        with gr.Accordion("⚙️ Search Settings", open=False):
                             emb_model = gr.Dropdown(embedding_models, value="CLIP (Multimodal)", label="Embedding Model")
                             gen_model = gr.Dropdown(generation_models, value="gpt-5-nano", label="Generation Model")
                             do_generate = gr.Checkbox(value=True, label="Enable Generation")
-                            
-                            with gr.Accordion("Advanced Parameters", open=False):
-                                k_slider = gr.Slider(1, 40, step=1, value=int(TOP_K), label="Top-K Results")
-                                w_slider = gr.Slider(0, 1, value=TEXT_WEIGHT, label="Text-Image Weight")
-                                proj_f = gr.Dropdown(["All"] + project_choices, value="All", label="Site Filter")
-                        
-                        query_img = gr.Image(label="Visual Query", type="pil")
+                            k_slider = gr.Slider(1, 40, step=1, value=int(TOP_K), label="Top-K Artifacts")
+                            w_slider = gr.Slider(0, 1, value=TEXT_WEIGHT, label="Text Weight")
+                            proj_f = gr.Dropdown(["All"] + project_choices, value="All", label="Filter by Project")
 
-                    # Primary Chat Panel
-                    with gr.Column(scale=4):
-                        with gr.Group():
-                            query_text = gr.Textbox(
-                                label="Query",
-                                placeholder="e.g., Describe pottery fragments from the Archaic period found in Sardis...",
-                                lines=2
-                            )
-                            submit_btn = gr.Button("Execute Search", variant="primary")
-                        
-                        response_box = gr.Markdown("### Response\n*Detailed analysis will appear here.*")
-                        
-                        with gr.Accordion("Evidence Gallery", open=True):
-                            gallery = gr.Gallery(label="Retrieved Artifacts", columns=4)
-                            details = gr.Markdown("### Technical Details\n*Result descriptions will load here.*")
+                        submit_btn = gr.Button("🔍 Search", variant="primary")
 
-                        # Feedback Form (Hidden until results are loaded)
+                    with gr.Column(scale=2):
+                        response_box = gr.Markdown("*Enter a question and click Search.*")
+
+                        gr.Markdown("### Retrieved Artifacts")
+                        gallery = gr.HTML(value="*Search results will appear here.*")
+
+                        details = gr.Markdown("### Technical Details\n*Result descriptions will load here.*")
+
                         with gr.Row(visible=False) as feedback_row:
                             with gr.Group():
                                 gr.Markdown("### Technical Evaluation")
@@ -300,36 +482,34 @@ def build_app() -> gr.Blocks:
                                 f_submit = gr.Button("Submit Evaluation", variant="secondary")
                                 f_status = gr.Markdown()
 
-                # Event Bindings
                 submit_btn.click(
-                    search_fn, 
+                    search_fn,
                     [query_text, query_img, k_slider, w_slider, proj_f, do_generate, emb_model, gen_model],
                     [response_box, gallery, details, interaction_state]
                 ).then(lambda: gr.update(visible=True), None, feedback_row)
-                
+
                 f_submit.click(save_feedback_fn, [interaction_state, rating_input, comment_input], f_status)
 
-            # Comparative Analysis Tab
-            with gr.TabItem("Battle Arena"):
+            with gr.TabItem("Battle Mode"):
                 with gr.Row():
                     with gr.Column(scale=1):
                         battle_text = gr.Textbox(label="Battle Query", lines=2)
                         battle_img = gr.Image(label="Visual Sample", type="pil")
-                        
+
                         with gr.Group():
                             gr.Markdown("### Arena Configuration")
                             emb_a_sel = gr.Dropdown(embedding_models, value="CLIP (Multimodal)", label="Embedding A")
-                            emb_b_sel = gr.Dropdown(embedding_models, value="BM25 (Text only)",   label="Embedding B")
+                            emb_b_sel = gr.Dropdown(embedding_models, value="EmbeddingGemma-300m (Text only)", label="Embedding B")
                             gen_enable = gr.Checkbox(value=True, label="Enable Generation")
-                            
+
                             with gr.Row() as gen_settings:
                                 gen_a_sel = gr.Dropdown(generation_models, value="gpt-5-nano", label="Generator A")
                                 gen_b_sel = gr.Dropdown(generation_models, value="gpt-4o-mini", label="Generator B")
-                            
+
                             gen_enable.change(lambda x: gr.update(visible=x), inputs=[gen_enable], outputs=[gen_settings])
-                        
+
                         battle_run = gr.Button("Initialize Battle", variant="primary")
-                        
+
                     with gr.Column(scale=2):
                         with gr.Row():
                             with gr.Column():
@@ -338,7 +518,12 @@ def build_app() -> gr.Blocks:
                             with gr.Column():
                                 output_b1 = gr.Markdown("### Model B1 (E_B, M_A)")
                                 output_b2 = gr.Markdown("### Model B2 (E_B, M_B)")
-                        
+
+                        gr.Markdown("### Retrieved Artifacts")
+                        battle_gallery = gr.HTML(value="*Battle results will appear here.*")
+
+                        battle_details = gr.Markdown("### Technical Details\n*Result descriptions will load here.*")
+
                         with gr.Group():
                             gr.Markdown("### Comparative Evaluation")
                             with gr.Row():
@@ -348,11 +533,11 @@ def build_app() -> gr.Blocks:
                                     battle_notes = gr.Textbox(label="Rationale", lines=2)
                             battle_submit = gr.Button("Record Comparison", variant="secondary")
                             battle_status = gr.Markdown()
-                
+
                 battle_run.click(
                     perform_4way_battle,
                     [battle_text, battle_img, k_slider, w_slider, proj_f, gen_enable, emb_a_sel, emb_b_sel, gen_a_sel, gen_b_sel],
-                    [output_a1, output_a2, output_b1, output_b2, gallery, details, battle_state]
+                    [output_a1, output_a2, output_b1, output_b2, battle_gallery, battle_details, battle_state]
                 )
                 battle_submit.click(save_battle_feedback_fn, [battle_state, winner_sel, battle_notes], battle_status)
 
