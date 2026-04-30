@@ -107,6 +107,11 @@ bash scripts/calculate_embeddings.sh \
   --image_path "path/to/image.jpg"
 ```
 
+### 4. Static UI to visualise retrieved artifacts
+```bash
+python visualise_queries.py
+```
+
 ---
 
 ## Development & Feedback
