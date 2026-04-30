@@ -2,8 +2,21 @@ from .generator import Generator
 from .gemini_generator import GeminiGenerator
 from .vlm_generator import VLMGenerator
 
+
+def _normalize_vlm_model_name(backend: str, model_name: str = None) -> str:
+    if model_name and "/" in model_name:
+        return model_name
+
+    defaults = {
+        "qwen3-vl": "Qwen/Qwen3-VL-2B-Instruct",
+        "internvl3": "OpenGVLab/InternVL3-1B",
+        "ovis2": "AIDC-AI/Ovis2-1B",
+    }
+    return defaults.get(backend, model_name)
+
 def get_generator(backend: str, model_name: str = None, api_key: str = None, base_url: str = None, device: str = None):
     backend = backend.lower()
+    model_name = _normalize_vlm_model_name(backend, model_name)
     
     if backend == "openai":
         return Generator(backend="openai", model=model_name, api_key=api_key)

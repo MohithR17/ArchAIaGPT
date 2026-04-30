@@ -7,8 +7,8 @@ from pathlib import Path
 
 # Filesystem Paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATASET_PATH = Path("/data/group_data/dei-group/archaia/archaia_hf_final")
-IMAGES_ROOT = Path("/data/group_data/dei-group/archaia")
+DATASET_PATH = Path("/home/mohithr/pw/storage/archaia_dataset_hf_v3")
+IMAGES_ROOT = Path("/home/urmid/archaia/")
 
 INDEX_DIR = PROJECT_ROOT / "indexes"
 TEXT_INDEX = INDEX_DIR / "text.faiss"
