@@ -41,6 +41,22 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
+Alternatively using simple conda
+
+```bash
+conda create -n archaia_full python=3.11 pip -y
+conda activate archaia_full
+pip install -r requirements_clean.txt
+```
+
+Note: for models such as gemma you need to pass huggingface token
+
+```bash
+python -m pip install --user huggingface_hub
+huggingface-cli login
+```
+
+
 ### 3. API Configuration
 Create a `.env` file in the root directory or set the following environment variables:
 ```bash
